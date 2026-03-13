@@ -108,15 +108,118 @@ Then open **http://localhost:8501** in your browser.
    ```
    Or copy just the ID after `user=`.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Streamlit Frontend                         │
+│                                                                     │
+│  ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
+│  │  Input    │  │   Author     │  │  Stats   │  │  Affiliations │  │
+│  │  Form     │  │   Profile    │  │  Metrics │  │  Browser      │  │
+│  └────┬─────┘  └──────────────┘  └──────────┘  └───────────────┘  │
+│       │                                                             │
+│  ┌────▼──────────────────────────────────────────────────────────┐  │
+│  │              Interactive Folium Map (Leaflet.js)              │  │
+│  │         CartoDB Positron · MarkerCluster · html2canvas        │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼────────────────────────────────────────┐
+│                       Data Fetching Layer                           │
+│                                                                     │
+│   ┌─────────────┐    ┌──────────────┐    ┌─────────────────────┐   │
+│   │  Disk Cache  │───▶│   SerpAPI    │───▶│  citation-map       │   │
+│   │  .cache/     │    │  (1 API call)│    │  scraping (fallback)│   │
+│   └─────────────┘    └──────┬───────┘    └──────────┬──────────┘   │
+│         ▲                   │                       │               │
+│         │          ┌────────▼────────┐     Exponential backoff      │
+│         │          │ Single call:    │     (30s, 60s, 120s)        │
+│         │          │ google_scholar_ │              │               │
+│         │          │ author returns: │              │               │
+│         │          │ · Profile       │              │               │
+│         │          │ · Articles      │              │               │
+│         │          │ · Co-authors    │              │               │
+│         │          │   (w/ affils)   │              │               │
+│         │          │ · Citation stats│              │               │
+│         │          └────────┬────────┘              │               │
+│         │                   │                       │               │
+│         └───────────────────┴───────────────────────┘               │
+│                         CSV cached per scholar_id                   │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼────────────────────────────────────────┐
+│                      Geocoding Pipeline                             │
+│                                                                     │
+│   ┌──────────────────┐    ┌──────────────┐    ┌─────────────────┐  │
+│   │ _clean_affiliation│───▶│  Nominatim   │───▶│  In-Memory      │  │
+│   │ (extract inst.   │    │  (OSM)       │    │  geocode_cache  │  │
+│   │  from verbose    │    │  geocoder    │    │                 │  │
+│   │  role strings)   │    └──────────────┘    └─────────────────┘  │
+│   └──────────────────┘                                              │
+│    Strips roles/titles      Tries each                              │
+│    Splits on , and .        candidate                               │
+│    Finds institution        until one                               │
+│    keywords                 resolves                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow
+
+```
+User Input ──▶ extract_scholar_id() ──▶ generate_citation_data()
+                                              │
+                          ┌───────────────────┬┘
+                          ▼                   ▼
+                   Disk Cache?           SerpAPI / Scraper
+                    (hit)                  (miss)
+                      │                      │
+                      ▼                      ▼
+                  Load CSV          Fetch & cache CSV + author profile
+                      │                      │
+                      └──────────┬───────────┘
+                                 ▼
+                         create_styled_map()
+                                 │
+                    ┌────────────┼────────────┐
+                    ▼            ▼            ▼
+              Geocode      Build Folium   Compute
+              affiliations   Map          stats
+                    │            │            │
+                    └────────────┼────────────┘
+                                 ▼
+                          Session State
+                    (map HTML, stats, profile)
+                                 │
+                                 ▼
+                         Render UI
+                   (profile + map + exports)
+```
+
 ## Project Structure
 
 ```
 citation/
-├── streamlit_app.py      # Main Streamlit web application
-├── run.sh                # Quick-start script
-├── requirements.txt      # Python dependencies
-├── README.md             # This file
-└── venv/                 # Virtual environment
+├── streamlit_app.py           # Main application (all logic in one file)
+│   ├── extract_scholar_id()   #   URL/ID parsing
+│   ├── _clean_affiliation()   #   Verbose affiliation → institution name
+│   ├── geocode_affiliation()  #   Institution → lat/lng via Nominatim
+│   ├── _fetch_via_serpapi()   #   SerpAPI 3-step fetch + author profile
+│   ├── _fetch_with_retry()    #   citation-map scraping with backoff
+│   ├── generate_citation_data()#  Tiered fetching: cache → API → scraper
+│   ├── create_styled_map()    #   Folium map with markers + download btn
+│   └── get_demo_data()        #   Synthetic data for Try Demo
+├── tests/
+│   ├── __init__.py
+│   └── test_streamlit_app.py  # 46 unit tests (Streamlit mocked)
+├── .streamlit/
+│   ├── config.toml            # Theme configuration
+│   └── secrets.toml           # SerpAPI key (gitignored)
+├── .cache/citations/          # Disk-cached CSV per scholar ID (gitignored)
+├── requirements.txt           # Python dependencies
+├── run.sh                     # Quick-start script
+├── .gitignore
+└── README.md
 ```
 
 ## Dependencies
@@ -124,30 +227,28 @@ citation/
 | Package | Purpose |
 |---------|---------|
 | `streamlit` | Web application framework |
-| `streamlit-folium` | Folium map integration for Streamlit |
-| `folium` | Interactive map generation |
-| `pandas` | Data manipulation |
-| `geopy` | Geocoding affiliations |
-| `citation-map` | Google Scholar data fetching |
+| `folium` | Interactive Leaflet map generation |
+| `pandas` | Data manipulation and CSV I/O |
+| `geopy` | Geocoding via Nominatim (OpenStreetMap) |
+| `citation-map` | Google Scholar scraping (fallback) |
+| `google-search-results` | SerpAPI client (preferred data source) |
 
 ## How It Works
 
-1. **Input Parsing**: The app accepts either a raw Scholar ID or a full Google Scholar profile URL, automatically extracting the user ID.
+1. **Input Parsing**: Accepts a raw Scholar ID or full Google Scholar profile URL — `extract_scholar_id()` handles both formats.
 
-2. **Data Collection**: The app uses the `citation-map` library (which wraps `scholarly`) to fetch citation data from Google Scholar for the given profile ID.
+2. **Tiered Data Fetching** (`generate_citation_data`):
+   - **Disk cache** — instant return if previously fetched (`.cache/citations/<id>.csv`)
+   - **SerpAPI** (preferred) — **single API call** to `google_scholar_author` returns the author's profile, articles, co-authors (with affiliations), and citation stats. Co-author affiliations are used as map locations.
+   - **citation-map scraping** (fallback) — direct Google Scholar scraping with exponential backoff retry (30s, 60s, 120s)
 
-3. **Affiliation Extraction**: For each citing paper, the app extracts the authors and their institutional affiliations.
+3. **Affiliation Cleaning** (`_clean_affiliation`): SerpAPI profiles return verbose strings like *"Associate Professor of Internal Medicine, Wayne State University"*. The cleaner extracts geocodable institution names by splitting on delimiters, stripping role/title prefixes, and detecting institution keywords.
 
-4. **Geocoding**: Affiliations are converted to geographic coordinates using:
-   - A built-in cache of common universities
-   - The Nominatim geocoding service (OpenStreetMap)
+4. **Geocoding** (`geocode_affiliation`): Each cleaned candidate is tried against the Nominatim geocoder (OpenStreetMap) until one resolves. Results are cached in memory.
 
-5. **Map Generation**: Coordinates are plotted on an interactive Folium map with:
-   - Marker clustering for dense areas
-   - Color-coded markers
-   - Popups with author/affiliation details
+5. **Map Generation** (`create_styled_map`): Coordinates are plotted on an interactive Folium map with marker clustering, color-coded markers, popups with author details, and a client-side "Download Map" button powered by `html2canvas`.
 
-6. **Export**: Users can download the map as a PNG image or the raw data as CSV.
+6. **Export**: Download the current map view as PNG (captures zoom/pan state) or the raw citation data as CSV.
 
 ## Limitations
 

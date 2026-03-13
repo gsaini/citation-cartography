@@ -198,27 +198,55 @@ class TestGeocodeAffiliation:
         from streamlit_app import geocode_cache
         geocode_cache.clear()
 
-    def test_manual_cache_exact_match(self):
-        """Should return pre-defined coords for a known institution."""
-        geolocator = MagicMock()
-        coords = geocode_affiliation("MIT", geolocator)
-        assert coords == (42.3601, -71.0942)
-        geolocator.geocode.assert_not_called()
+    def test_cleaned_candidate_geocodes(self):
+        """Should extract institution name and geocode it when raw string fails."""
+        mock_geolocator = MagicMock()
+        mock_location = MagicMock()
+        mock_location.latitude = 42.35
+        mock_location.longitude = -83.05
 
-    def test_manual_cache_case_insensitive(self):
-        """Manual cache lookup should be case-insensitive."""
-        geolocator = MagicMock()
-        coords = geocode_affiliation("stanford university", geolocator)
-        assert coords == (37.4275, -122.1697)
+        # Raw string fails, cleaned candidate "Wayne State University" succeeds
+        mock_geolocator.geocode.side_effect = lambda q, **kw: (
+            mock_location if "Wayne State University" in q else None
+        )
 
-    def test_manual_cache_substring_match(self):
-        """Should match when the manual key is a substring of the affiliation."""
-        geolocator = MagicMock()
-        coords = geocode_affiliation("Department of CS, MIT, Cambridge", geolocator)
-        assert coords == (42.3601, -71.0942)
+        coords = geocode_affiliation(
+            "Associate Professor of Internal Medicine, Wayne State University",
+            mock_geolocator,
+        )
+        assert coords == (42.35, -83.05)
 
-    def test_nominatim_fallback(self):
-        """Should fall back to Nominatim when not in manual cache."""
+    def test_verbose_affiliation_tries_multiple_candidates(self):
+        """Should try progressively cleaned candidates until one works."""
+        mock_geolocator = MagicMock()
+        mock_location = MagicMock()
+        mock_location.latitude = 43.66
+        mock_location.longitude = -79.39
+
+        mock_geolocator.geocode.side_effect = lambda q, **kw: (
+            mock_location if q == "University of Toronto" else None
+        )
+
+        coords = geocode_affiliation(
+            "Professor, Anesthesia, University Health Network, University of Toronto",
+            mock_geolocator,
+        )
+        assert coords == (43.66, -79.39)
+
+    def test_simple_affiliation_geocodes_directly(self):
+        """Simple institution names should geocode on the first try."""
+        mock_geolocator = MagicMock()
+        mock_location = MagicMock()
+        mock_location.latitude = 37.42
+        mock_location.longitude = -122.17
+        mock_geolocator.geocode.return_value = mock_location
+
+        coords = geocode_affiliation("Stanford University", mock_geolocator)
+        assert coords == (37.42, -122.17)
+        mock_geolocator.geocode.assert_called_once_with("Stanford University", timeout=10)
+
+    def test_nominatim_geocodes_simple_name(self):
+        """Should geocode a simple institution name via Nominatim."""
         mock_geolocator = MagicMock()
         mock_location = MagicMock()
         mock_location.latitude = 48.8566
@@ -227,7 +255,6 @@ class TestGeocodeAffiliation:
 
         coords = geocode_affiliation("Sorbonne University", mock_geolocator)
         assert coords == (48.8566, 2.3522)
-        mock_geolocator.geocode.assert_called_once_with("Sorbonne University", timeout=10)
 
     def test_nominatim_returns_none(self):
         """Should return None when Nominatim cannot resolve the affiliation."""
@@ -269,41 +296,68 @@ class TestGeocodeAffiliation:
 class TestGetDemoData:
     """Tests for ``get_demo_data``."""
 
+    def test_returns_tuple(self):
+        """Should return a (DataFrame, profile) tuple."""
+        result = get_demo_data()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
     def test_returns_dataframe(self):
-        """Should return a pandas DataFrame."""
-        df = get_demo_data()
+        """Should return a pandas DataFrame as the first element."""
+        df, _ = get_demo_data()
         assert isinstance(df, pd.DataFrame)
 
     def test_has_required_columns(self):
         """Should contain the columns expected by the rest of the app."""
-        df = get_demo_data()
+        df, _ = get_demo_data()
         assert "citing author name" in df.columns
         assert "affiliation" in df.columns
 
     def test_has_records(self):
         """Should contain at least one record."""
-        df = get_demo_data()
+        df, _ = get_demo_data()
         assert len(df) > 0
 
     def test_no_null_values(self):
         """All demo records should have non-null values."""
-        df = get_demo_data()
+        df, _ = get_demo_data()
         assert df.notna().all().all()
 
     def test_unique_authors(self):
         """All demo author names should be unique."""
-        df = get_demo_data()
+        df, _ = get_demo_data()
         assert df["citing author name"].is_unique
 
     def test_multiple_affiliations(self):
         """Demo data should span multiple institutions."""
-        df = get_demo_data()
+        df, _ = get_demo_data()
         assert df["affiliation"].nunique() >= 5
+
+    def test_profile_has_required_keys(self):
+        """Demo profile should contain name, affiliations, and cited_by."""
+        _, profile = get_demo_data()
+        assert isinstance(profile, dict)
+        assert "name" in profile
+        assert "affiliations" in profile
+        assert "cited_by" in profile
+        assert "co_authors" in profile
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  create_styled_map
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _mock_geocode(affiliation, geolocator):
+    """Deterministic geocode stub for map tests — returns fixed coords per affiliation."""
+    _coords = {
+        "MIT": (42.36, -71.09),
+        "Stanford University": (37.42, -122.17),
+        "Harvard University": (42.37, -71.12),
+        "Yale University": (41.31, -72.92),
+        "Oxford University": (51.75, -1.25),
+    }
+    return _coords.get(affiliation)
+
 
 class TestCreateStyledMap:
     """Tests for ``create_styled_map``."""
@@ -322,7 +376,8 @@ class TestCreateStyledMap:
             "affiliation": affiliations,
         })
 
-    def test_returns_map_and_stats(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_returns_map_and_stats(self, _mock):
         """Should return a folium.Map and a stats dict for valid data."""
         df = self._make_df(["MIT", "Stanford University"])
         m, stats = create_styled_map(df)
@@ -333,19 +388,22 @@ class TestCreateStyledMap:
         assert "mapped_locations" in stats
         assert "affiliations" in stats
 
-    def test_stats_total_citations(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_stats_total_citations(self, _mock):
         """total_citations should equal the row count of the input DataFrame."""
         df = self._make_df(["MIT", "Harvard University", "Yale University"])
         _, stats = create_styled_map(df)
         assert stats["total_citations"] == 3
 
-    def test_stats_mapped_locations(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_stats_mapped_locations(self, _mock):
         """mapped_locations should count successfully geocoded affiliations."""
         df = self._make_df(["MIT", "Stanford University"])
         _, stats = create_styled_map(df)
         assert stats["mapped_locations"] == 2
 
-    def test_stats_affiliations_list(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_stats_affiliations_list(self, _mock):
         """Each geocoded affiliation should appear in the affiliations list."""
         df = self._make_df(["MIT", "Oxford University"])
         _, stats = create_styled_map(df)
@@ -353,7 +411,8 @@ class TestCreateStyledMap:
         assert "MIT" in names
         assert "Oxford University" in names
 
-    def test_affiliation_has_coords(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_affiliation_has_coords(self, _mock):
         """Each affiliation record should include lat/lng coordinates."""
         df = self._make_df(["MIT"])
         _, stats = create_styled_map(df)
@@ -362,7 +421,8 @@ class TestCreateStyledMap:
         assert isinstance(affil["lat"], float)
         assert isinstance(affil["lng"], float)
 
-    def test_affiliation_has_authors(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_affiliation_has_authors(self, _mock):
         """Each affiliation record should list its authors."""
         df = self._make_df(
             ["MIT", "MIT"],
@@ -379,14 +439,16 @@ class TestCreateStyledMap:
         assert m is None
         assert stats == {}
 
-    def test_null_affiliations_filtered(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_null_affiliations_filtered(self, _mock):
         """Rows with NaN affiliations should be excluded, not crash."""
         df = self._make_df(["MIT", None], ["Alice", "Bob"])
         m, stats = create_styled_map(df)
         assert m is not None
         assert stats["mapped_locations"] == 1
 
-    def test_map_html_contains_download_button(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_map_html_contains_download_button(self, _mock):
         """The generated map HTML should contain the Download Map control."""
         df = self._make_df(["MIT"])
         m, _ = create_styled_map(df)
@@ -394,14 +456,16 @@ class TestCreateStyledMap:
         assert "html2canvas" in html
         assert "Download Map" in html
 
-    def test_map_html_contains_leaflet(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_map_html_contains_leaflet(self, _mock):
         """The generated map HTML should include Leaflet assets."""
         df = self._make_df(["MIT"])
         m, _ = create_styled_map(df)
         html = m._repr_html_()
         assert "leaflet" in html.lower()
 
-    def test_duplicate_affiliations_grouped(self):
+    @patch("streamlit_app.geocode_affiliation", side_effect=_mock_geocode)
+    def test_duplicate_affiliations_grouped(self, _mock):
         """Multiple rows with the same affiliation should produce one marker."""
         df = self._make_df(
             ["MIT", "MIT", "MIT"],

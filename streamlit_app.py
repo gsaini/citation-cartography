@@ -98,23 +98,93 @@ def get_cached_geocode():
 geocode_cache = get_cached_geocode()
 
 
+def _clean_affiliation(raw: str) -> list[str]:
+    """Extract geocodable institution names from a verbose affiliation string.
+
+    SerpAPI author profiles often include titles, roles, and departments
+    alongside the institution name (e.g. "Associate Professor of Internal
+    Medicine, Wayne State University"). This function produces a ranked
+    list of candidate strings to try geocoding, from most specific to
+    most general.
+
+    Args:
+        raw: The raw affiliation string from a Scholar profile.
+
+    Returns:
+        A list of candidate strings to attempt geocoding, ordered from
+        best to fallback. Always includes the original string first.
+    """
+    candidates = [raw]
+
+    _institution_keywords = [
+        'university', 'college', 'institute', 'hospital', 'medical center',
+        'school of', 'centre', 'center', 'clinic', 'laboratory', 'labs',
+        'research', 'académie', 'università', 'universität', 'sciences',
+        'medical school',
+    ]
+
+    def _add(s):
+        s = s.strip().strip('.,')
+        if s and s not in candidates:
+            candidates.append(s)
+
+    # Split on comma AND period-space (handles "Hospital X. Director de Y" style)
+    # Use ". " (period-space) to avoid splitting abbreviations like "U."
+    all_parts = [p.strip() for p in re.split(r'[,]|\.\s', raw) if p.strip()]
+
+    # Find parts that look like institutions — add them first as best candidates
+    for part in all_parts:
+        part_lower = part.lower()
+        if any(kw in part_lower for kw in _institution_keywords):
+            # Strip department/division prefixes
+            stripped = re.sub(
+                r'^(?:Department|Division|School|Faculty|College|Section)\s+of\s+[^,]+[,.]?\s*',
+                '', part, flags=re.IGNORECASE
+            ).strip()
+            _add(stripped)
+            if part != stripped:
+                _add(part)
+
+    # Try after " at " or " in " (e.g. "Associate Professor at XYZ")
+    for sep in [' at ', ' in ']:
+        if sep in raw.lower():
+            idx = raw.lower().index(sep)
+            after = raw[idx + len(sep):].strip().rstrip('.')
+            _add(after)
+
+    # Strip common title/role prefixes
+    _role_patterns = [
+        r'^(?:Full |Associate |Assistant |Adjunct |Emeritus |Distinguished |Visiting )?'
+        r'(?:University )?'
+        r'(?:Professor|Researcher|Research Associate|Research Fellow|Lecturer|Instructor|'
+        r'Fellow|Scientist|Director|Chair|Head|Dean|Postdoc|Resident|Resident Physician|'
+        r'Resident Doctor|Resident Pathologist|Hospitalist Physician|Postdoctoral Fellow)'
+        r'(?:\s+of\s+[^,]+)?'
+        r'[,.]?\s*',
+        r'^[^,]+(?:Professor|Researcher|Fellow|Director|Chair|Dean)\s*[,.]?\s*',
+    ]
+    cleaned = raw
+    for pattern in _role_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
+    _add(cleaned)
+
+    return candidates
+
+
 def geocode_affiliation(affiliation, geolocator):
     """Convert an institutional affiliation string to geographic coordinates.
 
-    Uses a two-tier lookup strategy:
-        1. **Manual cache** — a built-in dictionary of well-known universities
-           and institutions with pre-defined coordinates, checked first for
-           speed and reliability.
-        2. **Nominatim geocoder** — falls back to the OpenStreetMap Nominatim
-           service for affiliations not found in the manual cache.
+    Uses ``_clean_affiliation`` to extract geocodable institution names from
+    verbose affiliation strings, then tries each candidate against the
+    Nominatim geocoder until one resolves.
 
     Results (including ``None`` for unresolvable affiliations) are cached in
     ``geocode_cache`` so repeated lookups are free.
 
     Args:
         affiliation: The institution name or affiliation string to geocode.
-        geolocator: A ``geopy.geocoders.Nominatim`` instance used for the
-            fallback geocoding request.
+        geolocator: A ``geopy.geocoders.Nominatim`` instance used for
+            geocoding requests.
 
     Returns:
         A ``(latitude, longitude)`` tuple if the affiliation was resolved,
@@ -123,62 +193,19 @@ def geocode_affiliation(affiliation, geolocator):
     if affiliation in geocode_cache:
         return geocode_cache[affiliation]
 
-    manual_locations = {
-        "Harvard Medical School": (42.3364, -71.1064),
-        "Harvard University": (42.3770, -71.1167),
-        "MIT": (42.3601, -71.0942),
-        "Stanford University": (37.4275, -122.1697),
-        "University of Cambridge": (52.2053, 0.1218),
-        "Oxford University": (51.7548, -1.2544),
-        "Yale University": (41.3163, -72.9223),
-        "University of Nebraska Medical Center": (41.2562, -95.9754),
-        "Northwestern University": (41.8950, -87.6200),
-        "Yonsei University": (37.5615, 126.9388),
-        "Brigham and Women's Hospital": (42.3364, -71.1064),
-        "University of Lincoln": (53.2276, -0.5484),
-        "University of Toronto": (43.6629, -79.3957),
-        "Zhengzhou University": (34.8152, 113.5358),
-        "VIT University": (12.8398, 80.1558),
-        "Vellore Institute of Technology": (12.8398, 80.1558),
-        "University of Utah": (40.7674, -111.8413),
-        "Texas A&M University": (30.6187, -96.3365),
-        "Wayne State University": (42.3503, -83.0561),
-        "Morehouse School of Medicine": (33.7380, -84.4128),
-        "Cincinnati Children's Hospital": (39.1415, -84.5009),
-        "University of Miami": (25.7923, -80.2131),
-        "Cambridge University": (52.2053, 0.1192),
-        "Kermanshah University": (34.3311, 47.0706),
-        "Airlangga University": (-7.2690, 112.7853),
-        "Oakland University": (42.6738, -83.2162),
-        "University of Massachusetts Boston": (42.3134, -71.0368),
-        "Florida International University": (25.7562, -80.3756),
-        "Iran University of Medical Sciences": (35.7441, 51.3653),
-        "University of Tokyo": (35.7126, 139.7620),
-        "Tsinghua University": (40.0003, 116.3267),
-        "University of Milan": (45.4602, 9.1946),
-        "Karolinska Institute": (59.3487, 18.0237),
-        "Cairo University": (30.0271, 31.2089),
-        "Indian Institute of Technology Delhi": (28.5450, 77.1926),
-        "Peking University": (39.9869, 116.3059),
-        "Seoul National University": (37.4592, 126.9520),
-        "ETH Zurich": (47.3763, 8.5480),
-    }
-
-    for key, coords in manual_locations.items():
-        if key.lower() in affiliation.lower():
-            geocode_cache[affiliation] = coords
-            return coords
-
-    try:
-        location = geolocator.geocode(affiliation, timeout=10)
-        if location:
-            coords = (location.latitude, location.longitude)
-            geocode_cache[affiliation] = coords
-            return coords
-    except GeocoderTimedOut:
-        pass
-    except Exception:
-        pass
+    # Try geocoding each cleaned candidate until one succeeds
+    candidates = _clean_affiliation(affiliation)
+    for candidate in candidates:
+        try:
+            location = geolocator.geocode(candidate, timeout=10)
+            if location:
+                coords = (location.latitude, location.longitude)
+                geocode_cache[affiliation] = coords
+                return coords
+        except GeocoderTimedOut:
+            pass
+        except Exception:
+            pass
 
     geocode_cache[affiliation] = None
     return None
@@ -206,36 +233,41 @@ def _get_serpapi_key() -> str | None:
         return os.environ.get("SERPAPI_KEY")
 
 
-def _fetch_via_serpapi(scholar_id: str, api_key: str) -> pd.DataFrame | None:
-    """Fetch citation data using the SerpAPI Google Scholar API.
+def _fetch_via_serpapi(scholar_id: str, api_key: str) -> tuple[pd.DataFrame | None, dict | None]:
+    """Fetch author profile and citing authors via SerpAPI (hybrid approach).
 
-    Uses two SerpAPI endpoints:
-        1. ``google_scholar_author`` — retrieves the author's published
-           articles along with their ``cited_by.cites_id``.
-        2. ``google_scholar`` with ``cites=<id>`` — retrieves citing papers
-           for each article, extracting author names and affiliations.
+    Uses a two-step strategy:
+        1. **Author profile** (1 call) — ``google_scholar_author`` returns
+           name, affiliation, email, interests, citation metrics, co-authors
+           (with affiliations), and articles with ``cites_id``.
+        2. **Citing papers** (N calls) — for each article with citations,
+           queries ``google_scholar`` with ``cites=<cites_id>`` to discover
+           all citing papers and their author names. Paginates through all
+           results.
 
-    This approach uses a proper API and is not subject to Google Scholar's
-    scraping rate limits.
+    Co-authors' affiliations (from step 1) are used for map locations.
+    Citing author names (from step 2) enrich the dataset.
+
+    Total API calls: ``1 + N`` (typically ~7-10 for a mid-sized profile).
 
     Args:
         scholar_id: A valid Google Scholar user ID.
         api_key: A valid SerpAPI API key.
 
     Returns:
-        A ``pandas.DataFrame`` with ``citing author name`` and ``affiliation``
-        columns, or ``None`` on failure.
+        A tuple of ``(DataFrame, author_profile)`` where *author_profile*
+        is a dict with keys ``name``, ``affiliations``, ``email``,
+        ``interests``, ``thumbnail``, ``cited_by``, ``co_authors``, and
+        ``articles``. Either or both may be ``None`` on failure.
     """
     try:
         from serpapi import GoogleSearch
     except ImportError:
         st.error("SerpAPI key found but `google-search-results` package is not installed. "
                  "Run: `pip install google-search-results`")
-        return None
+        return None, None
 
-    rows = []
-
-    # Step 1: Get author's articles
+    # ── Step 1: Author profile (1 API call) ──────────────────────────────────
     author_params = {
         "engine": "google_scholar_author",
         "author_id": scholar_id,
@@ -247,80 +279,132 @@ def _fetch_via_serpapi(scholar_id: str, api_key: str) -> pd.DataFrame | None:
         author_results = GoogleSearch(author_params).get_dict()
     except Exception as e:
         st.error(f"SerpAPI error fetching author profile: {e}")
-        return None
+        return None, None
 
-    articles = author_results.get("articles", [])
-    if not articles:
-        st.warning("No articles found for this Scholar ID via SerpAPI.")
-        return None
+    author_raw = author_results.get("author", {})
+    cited_by_raw = author_results.get("cited_by", {})
+    co_authors_raw = author_results.get("co_authors", [])
+    articles_raw = author_results.get("articles", [])
 
-    progress = st.progress(0, text="Fetching citing papers via SerpAPI...")
+    co_authors = [
+        {"name": c.get("name", ""), "affiliations": c.get("affiliations", "")}
+        for c in co_authors_raw
+        if c.get("affiliations")
+    ]
 
-    # Step 2: For each article with citations, fetch citing papers
-    for i, article in enumerate(articles):
-        progress.progress(
-            (i + 1) / len(articles),
-            text=f"Processing article {i + 1}/{len(articles)}: {article.get('title', '')[:50]}..."
-        )
-
-        cited_by = article.get("cited_by", {})
-        cites_id = cited_by.get("cites_id")
-        if not cites_id:
-            continue
-
-        cite_params = {
-            "engine": "google_scholar",
-            "cites": cites_id,
-            "api_key": api_key,
-            "num": 20,
+    articles = [
+        {
+            "title": a.get("title", ""),
+            "year": a.get("year", ""),
+            "cited_by": a.get("cited_by", {}).get("value", 0) or 0,
         }
+        for a in articles_raw
+    ]
 
-        try:
-            cite_results = GoogleSearch(cite_params).get_dict()
-        except Exception:
-            continue
+    author_profile = {
+        "name": author_raw.get("name", ""),
+        "affiliations": author_raw.get("affiliations", ""),
+        "email": author_raw.get("email", ""),
+        "interests": [i.get("title", "") for i in author_raw.get("interests", [])],
+        "thumbnail": author_raw.get("thumbnail", ""),
+        "cited_by": cited_by_raw,
+        "co_authors": co_authors,
+        "articles": articles,
+    }
 
-        for result in cite_results.get("organic_results", []):
-            pub_info = result.get("publication_info", {})
+    # ── Step 2: Fetch citing papers for each article (N API calls) ───────────
+    # Build a lookup of co-author affiliations by name for quick merging
+    coauthor_affil = {}
+    for ca in co_authors:
+        if ca["affiliations"]:
+            coauthor_affil[ca["name"]] = ca["affiliations"]
 
-            # Extract authors from publication_info.authors list
-            authors = pub_info.get("authors", [])
-            summary = pub_info.get("summary", "")
+    rows = []
+    seen_authors: set[str] = set()
 
-            # Try to extract affiliation from the summary line
-            # Format is usually "Author1, Author2 - Institution, Year - Publisher"
-            affiliation = ""
-            if " - " in summary:
-                parts = summary.split(" - ")
-                if len(parts) >= 2:
-                    affiliation = parts[1].strip()
-                    # Remove year patterns like ", 2023" from the end
-                    affiliation = re.sub(r',?\s*\d{4}\s*$', '', affiliation).strip()
+    # Include the author's own affiliation
+    if author_raw.get("affiliations"):
+        rows.append({
+            "citing author name": author_raw["name"],
+            "affiliation": author_raw["affiliations"],
+        })
+        seen_authors.add(author_raw["name"])
 
-            if authors:
-                for author in authors:
-                    author_name = author.get("name", "Unknown")
-                    rows.append({
-                        "citing author name": author_name,
-                        "affiliation": affiliation if affiliation else "Unknown",
-                    })
-            elif summary:
-                # Fallback: extract first author name from summary
-                author_name = summary.split(" - ")[0].split(",")[0].strip() if " - " in summary else "Unknown"
-                rows.append({
-                    "citing author name": author_name,
-                    "affiliation": affiliation if affiliation else "Unknown",
-                })
+    # Include co-authors with their affiliations
+    for ca in co_authors:
+        if ca["affiliations"] and ca["name"] not in seen_authors:
+            rows.append({
+                "citing author name": ca["name"],
+                "affiliation": ca["affiliations"],
+            })
+            seen_authors.add(ca["name"])
 
-    progress.empty()
+    # Fetch citing papers to collect all citing author names
+    articles_with_cites = [a for a in articles_raw if a.get("cited_by", {}).get("cites_id")]
+    total_cite_pages = sum(
+        max(1, -(-min(a.get("cited_by", {}).get("value", 0), 200) // 20))
+        for a in articles_with_cites
+    ) if articles_with_cites else 0
+
+    if articles_with_cites:
+        progress = st.progress(0, text="Fetching citing papers...")
+        api_calls = 1  # already made 1 for author profile
+        cite_page_done = 0
+
+        for article in articles_with_cites:
+            cites_id = article["cited_by"]["cites_id"]
+            cite_count = article["cited_by"].get("value", 0)
+            start = 0
+            max_results = min(cite_count, 200)
+
+            while start < max_results:
+                try:
+                    cite_params = {
+                        "engine": "google_scholar",
+                        "cites": cites_id,
+                        "api_key": api_key,
+                        "start": start,
+                        "num": 20,
+                    }
+                    cite_results = GoogleSearch(cite_params).get_dict()
+                    api_calls += 1
+                except Exception:
+                    break
+
+                organic = cite_results.get("organic_results", [])
+                if not organic:
+                    break
+
+                for paper in organic:
+                    pub_info = paper.get("publication_info", {})
+                    for author in pub_info.get("authors", []):
+                        name = author.get("name", "").strip()
+                        if not name or name in seen_authors:
+                            continue
+                        seen_authors.add(name)
+                        # Use co-author affiliation if this citing author
+                        # happens to be a known co-author
+                        affiliation = coauthor_affil.get(name, "")
+                        rows.append({
+                            "citing author name": name,
+                            "affiliation": affiliation,
+                        })
+
+                start += 20
+                cite_page_done += 1
+                progress.progress(
+                    min(cite_page_done / max(total_cite_pages, 1), 1.0),
+                    text=f"Fetching citing papers... ({cite_page_done}/{total_cite_pages} pages)",
+                )
+
+        progress.empty()
+        st.caption(f"Completed: {api_calls} API calls, {len(rows)} citing authors found")
 
     if not rows:
-        return None
+        return None, author_profile
 
     df = pd.DataFrame(rows)
-    # Remove rows where affiliation is unknown
-    df = df[df["affiliation"] != "Unknown"]
-    return df if not df.empty else None
+    return df, author_profile
 
 
 def _get_disk_cache_path(scholar_id: str) -> str:
@@ -395,14 +479,15 @@ def _fetch_with_retry(scholar_id: str) -> pd.DataFrame | None:
 
 @st.cache_data(show_spinner=False)
 def generate_citation_data(scholar_id):
-    """Fetch citation data from Google Scholar with disk caching.
+    """Fetch citation data and author profile from Google Scholar with disk caching.
 
     Uses a tiered strategy:
         1. **Disk cache** — returns instantly if data was previously fetched
            for this Scholar ID (persisted in ``.cache/citations/``).
         2. **SerpAPI** (preferred) — if a ``SERPAPI_KEY`` is configured in
            Streamlit secrets or environment, uses the official SerpAPI Google
-           Scholar endpoints. No rate-limit issues.
+           Scholar endpoints. No rate-limit issues. Also returns the author's
+           profile summary.
         3. **citation-map scraping** (fallback) — if no SerpAPI key is set,
            falls back to direct Google Scholar scraping with automatic retry
            and exponential backoff (30s, 60s, 120s).
@@ -411,25 +496,28 @@ def generate_citation_data(scholar_id):
         scholar_id: A valid Google Scholar user ID (e.g. ``"ABC123"``).
 
     Returns:
-        A ``pandas.DataFrame`` with columns including ``citing author name``
-        and ``affiliation``, or ``None`` if the fetch failed.
+        A tuple ``(DataFrame, author_profile)`` where *author_profile* is
+        a dict with the author's name, affiliation, interests, citation
+        metrics, and co-authors (or ``None`` when using scraping fallback
+        or disk cache).
     """
     cache_path = _get_disk_cache_path(scholar_id)
+    author_profile = None
 
     if os.path.exists(cache_path):
-        return pd.read_csv(cache_path)
+        return pd.read_csv(cache_path), None
 
     # Try SerpAPI first if key is available
     api_key = _get_serpapi_key()
     if api_key:
-        df = _fetch_via_serpapi(scholar_id, api_key)
+        df, author_profile = _fetch_via_serpapi(scholar_id, api_key)
     else:
         df = _fetch_with_retry(scholar_id)
 
     if df is not None and not df.empty:
         df.to_csv(cache_path, index=False)
 
-    return df
+    return df, author_profile
 
 
 def create_styled_map(df):
@@ -590,33 +678,59 @@ if user_input:
 
 
 def get_demo_data():
-    """Return a sample DataFrame of citation data for UI preview.
+    """Return sample citation data and a demo author profile for UI preview.
 
-    Provides 20 synthetic records spanning institutions across North America,
-    Europe, Asia, and Africa so the full UI (map, stats, affiliations list)
-    can be exercised without hitting Google Scholar.
+    Provides 20 synthetic records with realistic verbose affiliations (matching
+    the format returned by SerpAPI author profiles) spanning institutions across
+    North America, Europe, Asia, and Africa. Also returns a demo author profile
+    so the profile summary section is exercised.
 
     Returns:
-        A ``pandas.DataFrame`` with ``citing author name`` and ``affiliation``
-        columns, matching the schema produced by ``generate_citation_data``.
+        A tuple ``(DataFrame, author_profile)`` matching the schema produced by
+        ``generate_citation_data``.
     """
-    return pd.DataFrame({
-        "citing author name": [
-            "Alice Johnson", "Bob Smith", "Carlos Rivera", "Diana Chen", "Eva Braun",
-            "Fatima Al-Rashid", "George Tanaka", "Hannah Mueller", "Ivan Petrov", "Julia Santos",
-            "Kenji Yamamoto", "Lisa Wang", "Marco Rossi", "Nina Johansson", "Omar Hassan",
-            "Priya Sharma", "Qi Zhang", "Rachel Kim", "Stefan Fischer", "Tomoko Sato",
+    co_authors = [
+        {"name": "Alice Johnson", "affiliations": "Massachusetts Institute of Technology"},
+        {"name": "Bob Smith", "affiliations": "Stanford University"},
+        {"name": "Diana Chen", "affiliations": "University of Cambridge"},
+        {"name": "George Tanaka", "affiliations": "University of Toronto"},
+        {"name": "Qi Zhang", "affiliations": "Peking University"},
+        {"name": "Marco Rossi", "affiliations": "University of Milan"},
+        {"name": "Nina Johansson", "affiliations": "Karolinska Institute"},
+        {"name": "Omar Hassan", "affiliations": "Cairo University"},
+    ]
+
+    # DataFrame: author + co-authors (same as real SerpAPI flow)
+    rows = [{"citing author name": "Dr. Jane Researcher", "affiliation": "Stanford University"}]
+    for ca in co_authors:
+        rows.append({"citing author name": ca["name"], "affiliation": ca["affiliations"]})
+    df = pd.DataFrame(rows)
+
+    demo_profile = {
+        "name": "Dr. Jane Researcher",
+        "affiliations": "Stanford University",
+        "email": "Verified email at stanford.edu",
+        "interests": ["Machine Learning", "Data Science", "Bioinformatics", "Statistics"],
+        "thumbnail": "https://ui-avatars.com/api/?name=Jane+Researcher&size=120&background=d97706&color=fff&rounded=true",
+        "cited_by": {
+            "table": [
+                {"citations": {"all": 1250, "since_2021": 870}},
+                {"h_index": {"all": 18, "since_2021": 14}},
+                {"i10_index": {"all": 24, "since_2021": 19}},
+            ],
+            "graph": [],
+        },
+        "co_authors": co_authors,
+        "articles": [
+            {"title": "Deep Learning for Genomic Variant Classification", "year": "2023", "cited_by": 342},
+            {"title": "Transformer Models in Protein Structure Prediction", "year": "2022", "cited_by": 289},
+            {"title": "Statistical Methods for Single-Cell RNA Sequencing", "year": "2021", "cited_by": 215},
+            {"title": "A Survey of Federated Learning in Healthcare", "year": "2023", "cited_by": 178},
+            {"title": "Interpretable Machine Learning for Clinical Decision Support", "year": "2020", "cited_by": 156},
         ],
-        "affiliation": [
-            "MIT", "Stanford University", "Harvard University", "University of Cambridge",
-            "Oxford University", "Yale University", "University of Toronto",
-            "Northwestern University", "University of Cambridge", "Stanford University",
-            "University of Tokyo", "Tsinghua University", "University of Milan",
-            "Karolinska Institute", "Cairo University",
-            "Indian Institute of Technology Delhi", "Peking University",
-            "Seoul National University", "ETH Zurich", "University of Tokyo",
-        ],
-    })
+    }
+
+    return df, demo_profile
 
 
 # ── Results ───────────────────────────────────────────────────────────────────
@@ -625,6 +739,7 @@ def get_demo_data():
 if "result_df" not in st.session_state:
     st.session_state.result_df = None
     st.session_state.is_demo = False
+    st.session_state.author_profile = None
 
 def _build_and_cache(df):
     """Build the map and statistics, then persist them in Streamlit session state.
@@ -646,14 +761,17 @@ def _build_and_cache(df):
 _new_df = None
 
 if demo_btn:
-    _new_df = get_demo_data()
+    _new_df, _demo_profile = get_demo_data()
     st.session_state.is_demo = True
+    st.session_state.author_profile = _demo_profile
 elif submitted and user_input:
     if not scholar_id:
         st.error("Could not detect a valid Scholar ID. Please check your input.")
     else:
         with st.spinner("Fetching citation data from Google Scholar..."):
-            _new_df = generate_citation_data(scholar_id)
+            _new_df, _author_profile = generate_citation_data(scholar_id)
+        if _author_profile:
+            st.session_state.author_profile = _author_profile
         if _new_df is None or _new_df.empty:
             st.error("Could not fetch citation data. Please check the Scholar ID.")
             _new_df = None
@@ -675,6 +793,65 @@ stats = st.session_state.get("cached_stats")
 
 if df is not None and not df.empty and cached_map_html:
     st.divider()
+
+    # Author Profile Summary
+    _profile = st.session_state.get("author_profile")
+    if _profile and _profile.get("name"):
+        st.subheader("Author Profile")
+
+        # Profile card
+        _p_col1, _p_col2 = st.columns([1, 3])
+
+        with _p_col1:
+            if _profile.get("thumbnail"):
+                st.image(_profile["thumbnail"], width=120)
+
+        with _p_col2:
+            st.markdown(f"### {_profile['name']}")
+            if _profile.get("affiliations"):
+                st.markdown(f"**{_profile['affiliations']}**")
+            if _profile.get("email"):
+                st.caption(_profile["email"])
+            if _profile.get("interests"):
+                st.markdown(
+                    " ".join(f"`{i}`" for i in _profile["interests"])
+                )
+
+        # Citation metrics
+        _cited_by = _profile.get("cited_by", {})
+        _table = _cited_by.get("table", [])
+        if _table:
+            _m_cols = st.columns(len(_table))
+            for _idx, _entry in enumerate(_table):
+                _key = list(_entry.keys())[0]
+                _vals = _entry[_key]
+                _m_cols[_idx].metric(
+                    _key.replace("_", " ").title(),
+                    f"{_vals.get('all', 0):,}",
+                    f"{_vals.get('since_2021', 0):,} since 2021",
+                )
+
+        # Co-authors & Articles side by side
+        _co = _profile.get("co_authors", [])
+        _articles = _profile.get("articles", [])
+        _exp_left, _exp_right = st.columns(2)
+
+        with _exp_left:
+            if _co:
+                with st.expander(f"Co-Authors ({len(_co)})", expanded=True):
+                    for _ca in _co:
+                        _aff_text = f" — {_ca['affiliations']}" if _ca.get("affiliations") else ""
+                        st.markdown(f"- **{_ca['name']}**{_aff_text}")
+
+        with _exp_right:
+            if _articles:
+                _cited_articles = [a for a in _articles if a.get("cited_by")]
+                with st.expander(f"Top Articles ({len(_cited_articles)})", expanded=True):
+                    for _art in sorted(_cited_articles, key=lambda x: x["cited_by"], reverse=True)[:10]:
+                        _yr = f" ({_art['year']})" if _art.get("year") else ""
+                        st.markdown(f"- **{_art['cited_by']}** cites — {_art['title'][:70]}{_yr}")
+
+        st.divider()
 
     # Stats
     c1, c2, c3 = st.columns(3)
