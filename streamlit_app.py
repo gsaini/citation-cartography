@@ -184,50 +184,252 @@ def geocode_affiliation(affiliation, geolocator):
     return None
 
 
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache", "citations")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+_MAX_RETRIES = 3
+_BACKOFF_SECONDS = [30, 60, 120]
+
+
+def _get_serpapi_key() -> str | None:
+    """Retrieve the SerpAPI key from Streamlit secrets or environment.
+
+    Checks ``st.secrets["SERPAPI_KEY"]`` first, then falls back to the
+    ``SERPAPI_KEY`` environment variable.
+
+    Returns:
+        The API key string, or ``None`` if not configured.
+    """
+    try:
+        return st.secrets["SERPAPI_KEY"]
+    except Exception:
+        return os.environ.get("SERPAPI_KEY")
+
+
+def _fetch_via_serpapi(scholar_id: str, api_key: str) -> pd.DataFrame | None:
+    """Fetch citation data using the SerpAPI Google Scholar API.
+
+    Uses two SerpAPI endpoints:
+        1. ``google_scholar_author`` — retrieves the author's published
+           articles along with their ``cited_by.cites_id``.
+        2. ``google_scholar`` with ``cites=<id>`` — retrieves citing papers
+           for each article, extracting author names and affiliations.
+
+    This approach uses a proper API and is not subject to Google Scholar's
+    scraping rate limits.
+
+    Args:
+        scholar_id: A valid Google Scholar user ID.
+        api_key: A valid SerpAPI API key.
+
+    Returns:
+        A ``pandas.DataFrame`` with ``citing author name`` and ``affiliation``
+        columns, or ``None`` on failure.
+    """
+    try:
+        from serpapi import GoogleSearch
+    except ImportError:
+        st.error("SerpAPI key found but `google-search-results` package is not installed. "
+                 "Run: `pip install google-search-results`")
+        return None
+
+    rows = []
+
+    # Step 1: Get author's articles
+    author_params = {
+        "engine": "google_scholar_author",
+        "author_id": scholar_id,
+        "api_key": api_key,
+        "num": 100,
+    }
+
+    try:
+        author_results = GoogleSearch(author_params).get_dict()
+    except Exception as e:
+        st.error(f"SerpAPI error fetching author profile: {e}")
+        return None
+
+    articles = author_results.get("articles", [])
+    if not articles:
+        st.warning("No articles found for this Scholar ID via SerpAPI.")
+        return None
+
+    progress = st.progress(0, text="Fetching citing papers via SerpAPI...")
+
+    # Step 2: For each article with citations, fetch citing papers
+    for i, article in enumerate(articles):
+        progress.progress(
+            (i + 1) / len(articles),
+            text=f"Processing article {i + 1}/{len(articles)}: {article.get('title', '')[:50]}..."
+        )
+
+        cited_by = article.get("cited_by", {})
+        cites_id = cited_by.get("cites_id")
+        if not cites_id:
+            continue
+
+        cite_params = {
+            "engine": "google_scholar",
+            "cites": cites_id,
+            "api_key": api_key,
+            "num": 20,
+        }
+
+        try:
+            cite_results = GoogleSearch(cite_params).get_dict()
+        except Exception:
+            continue
+
+        for result in cite_results.get("organic_results", []):
+            pub_info = result.get("publication_info", {})
+
+            # Extract authors from publication_info.authors list
+            authors = pub_info.get("authors", [])
+            summary = pub_info.get("summary", "")
+
+            # Try to extract affiliation from the summary line
+            # Format is usually "Author1, Author2 - Institution, Year - Publisher"
+            affiliation = ""
+            if " - " in summary:
+                parts = summary.split(" - ")
+                if len(parts) >= 2:
+                    affiliation = parts[1].strip()
+                    # Remove year patterns like ", 2023" from the end
+                    affiliation = re.sub(r',?\s*\d{4}\s*$', '', affiliation).strip()
+
+            if authors:
+                for author in authors:
+                    author_name = author.get("name", "Unknown")
+                    rows.append({
+                        "citing author name": author_name,
+                        "affiliation": affiliation if affiliation else "Unknown",
+                    })
+            elif summary:
+                # Fallback: extract first author name from summary
+                author_name = summary.split(" - ")[0].split(",")[0].strip() if " - " in summary else "Unknown"
+                rows.append({
+                    "citing author name": author_name,
+                    "affiliation": affiliation if affiliation else "Unknown",
+                })
+
+    progress.empty()
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    # Remove rows where affiliation is unknown
+    df = df[df["affiliation"] != "Unknown"]
+    return df if not df.empty else None
+
+
+def _get_disk_cache_path(scholar_id: str) -> str:
+    """Return the file path for the on-disk citation cache for a scholar ID.
+
+    Args:
+        scholar_id: The Google Scholar user ID.
+
+    Returns:
+        Absolute path to the cached CSV file.
+    """
+    return os.path.join(_CACHE_DIR, f"{scholar_id}.csv")
+
+
+def _fetch_with_retry(scholar_id: str) -> pd.DataFrame | None:
+    """Attempt to fetch citation data with exponential backoff on rate limits.
+
+    Retries up to ``_MAX_RETRIES`` times when Google Scholar blocks the
+    request, waiting ``_BACKOFF_SECONDS[i]`` seconds between attempts.
+    A Streamlit status area shows countdown progress during waits.
+
+    Args:
+        scholar_id: A valid Google Scholar user ID.
+
+    Returns:
+        A ``pandas.DataFrame`` of citation data, or ``None`` if all
+        attempts failed.
+    """
+    temp_dir = tempfile.mkdtemp()
+    csv_path = os.path.join(temp_dir, "citation_info.csv")
+    map_path = os.path.join(temp_dir, "citation_map.html")
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            generate_citation_map(
+                scholar_id,
+                output_path=map_path,
+                csv_output_path=csv_path,
+                num_processes=2,
+                pin_colorful=True,
+                print_citing_affiliations=True,
+                use_proxy=False,
+            )
+            if os.path.exists(csv_path):
+                return pd.read_csv(csv_path)
+            return None
+        except Exception as e:
+            msg = str(e)
+            is_rate_limit = "Cannot Fetch" in msg or "Google Scholar" in msg
+            if is_rate_limit and attempt < _MAX_RETRIES - 1:
+                wait = _BACKOFF_SECONDS[attempt]
+                placeholder = st.empty()
+                for remaining in range(wait, 0, -1):
+                    placeholder.warning(
+                        f"Rate-limited by Google Scholar. "
+                        f"Retrying in {remaining}s "
+                        f"(attempt {attempt + 2}/{_MAX_RETRIES})..."
+                    )
+                    time.sleep(1)
+                placeholder.empty()
+            elif is_rate_limit:
+                st.error(
+                    "Google Scholar is temporarily blocking requests (rate limit). "
+                    "Please wait a few minutes and try again."
+                )
+                return None
+            else:
+                st.error(f"Error fetching data: {msg}")
+                return None
+    return None
+
+
 @st.cache_data(show_spinner=False)
 def generate_citation_data(scholar_id):
-    """Fetch citation data from Google Scholar for the given profile.
+    """Fetch citation data from Google Scholar with disk caching.
 
-    Delegates to the ``citation-map`` library, which scrapes Google Scholar
-    to collect citing papers and their authors' affiliations. The results
-    are written to a temporary CSV file and loaded into a DataFrame.
+    Uses a tiered strategy:
+        1. **Disk cache** — returns instantly if data was previously fetched
+           for this Scholar ID (persisted in ``.cache/citations/``).
+        2. **SerpAPI** (preferred) — if a ``SERPAPI_KEY`` is configured in
+           Streamlit secrets or environment, uses the official SerpAPI Google
+           Scholar endpoints. No rate-limit issues.
+        3. **citation-map scraping** (fallback) — if no SerpAPI key is set,
+           falls back to direct Google Scholar scraping with automatic retry
+           and exponential backoff (30s, 60s, 120s).
 
     Args:
         scholar_id: A valid Google Scholar user ID (e.g. ``"ABC123"``).
 
     Returns:
         A ``pandas.DataFrame`` with columns including ``citing author name``
-        and ``affiliation``, or ``None`` if the fetch failed. Displays a
-        Streamlit error message on failure (rate-limit or other exceptions).
+        and ``affiliation``, or ``None`` if the fetch failed.
     """
-    temp_dir = tempfile.mkdtemp()
-    csv_path = os.path.join(temp_dir, 'citation_info.csv')
-    map_path = os.path.join(temp_dir, 'citation_map.html')
+    cache_path = _get_disk_cache_path(scholar_id)
 
-    try:
-        generate_citation_map(
-            scholar_id,
-            output_path=map_path,
-            csv_output_path=csv_path,
-            num_processes=2,
-            pin_colorful=True,
-            print_citing_affiliations=True,
-            use_proxy=False,
-        )
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path)
 
-        if os.path.exists(csv_path):
-            return pd.read_csv(csv_path)
-        return None
-    except Exception as e:
-        msg = str(e)
-        if "Cannot Fetch" in msg or "Google Scholar" in msg:
-            st.error(
-                "Google Scholar is temporarily blocking requests (rate limit). "
-                "Please wait a few minutes and try again."
-            )
-        else:
-            st.error(f"Error fetching data: {msg}")
-        return None
+    # Try SerpAPI first if key is available
+    api_key = _get_serpapi_key()
+    if api_key:
+        df = _fetch_via_serpapi(scholar_id, api_key)
+    else:
+        df = _fetch_with_retry(scholar_id)
+
+    if df is not None and not df.empty:
+        df.to_csv(cache_path, index=False)
+
+    return df
 
 
 def create_styled_map(df):
@@ -441,24 +643,28 @@ def _build_and_cache(df):
         st.session_state.cached_map_html = citation_map._repr_html_() if citation_map else None
         st.session_state.cached_stats = stats
 
+_new_df = None
+
 if demo_btn:
-    st.session_state.result_df = get_demo_data()
+    _new_df = get_demo_data()
     st.session_state.is_demo = True
-    _build_and_cache(st.session_state.result_df)
 elif submitted and user_input:
     if not scholar_id:
         st.error("Could not detect a valid Scholar ID. Please check your input.")
     else:
-        with st.spinner("Fetching citations and building map — this may take a minute..."):
-            df = generate_citation_data(scholar_id)
-            if df is not None and not df.empty:
-                st.session_state.result_df = df
-                st.session_state.is_demo = False
-                _build_and_cache(df)
-            else:
-                st.error("Could not fetch citation data. Please check the Scholar ID.")
+        with st.spinner("Fetching citation data from Google Scholar..."):
+            _new_df = generate_citation_data(scholar_id)
+        if _new_df is None or _new_df.empty:
+            st.error("Could not fetch citation data. Please check the Scholar ID.")
+            _new_df = None
+        else:
+            st.session_state.is_demo = False
 elif submitted:
     st.warning("Please enter a Google Scholar ID or profile URL.")
+
+if _new_df is not None and not _new_df.empty:
+    st.session_state.result_df = _new_df
+    _build_and_cache(_new_df)
 
 if st.session_state.is_demo:
     st.info("Showing demo data to preview the UI.", icon="🧪")

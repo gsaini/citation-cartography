@@ -7,3 +7,4 @@ dist/
 build/
 .streamlit/secrets.toml
 .env
+.cache/
