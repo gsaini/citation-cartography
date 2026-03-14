@@ -10,6 +10,7 @@ import tempfile
 import os
 import time
 import re
+import json
 from urllib.parse import urlparse, parse_qs
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -502,10 +503,18 @@ def generate_citation_data(scholar_id):
         or disk cache).
     """
     cache_path = _get_disk_cache_path(scholar_id)
+    profile_path = cache_path.replace(".csv", "_profile.json")
     author_profile = None
 
     if os.path.exists(cache_path):
-        return pd.read_csv(cache_path), None
+        # Load cached profile if available
+        if os.path.exists(profile_path):
+            try:
+                with open(profile_path, "r") as f:
+                    author_profile = json.load(f)
+            except Exception:
+                pass
+        return pd.read_csv(cache_path), author_profile
 
     # Try SerpAPI first if key is available
     api_key = _get_serpapi_key()
@@ -516,6 +525,12 @@ def generate_citation_data(scholar_id):
 
     if df is not None and not df.empty:
         df.to_csv(cache_path, index=False)
+        if author_profile:
+            try:
+                with open(profile_path, "w") as f:
+                    json.dump(author_profile, f)
+            except Exception:
+                pass
 
     return df, author_profile
 
