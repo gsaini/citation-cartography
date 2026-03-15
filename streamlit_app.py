@@ -479,7 +479,7 @@ def _fetch_with_retry(scholar_id: str) -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False)
-def generate_citation_data(scholar_id):
+def generate_citation_data(scholar_id, _version=2):
     """Fetch citation data and author profile from Google Scholar with disk caching.
 
     Uses a tiered strategy:
@@ -514,6 +514,42 @@ def generate_citation_data(scholar_id):
                     author_profile = json.load(f)
             except Exception:
                 pass
+        # If CSV exists but profile is missing, re-fetch profile only
+        if author_profile is None:
+            api_key = _get_serpapi_key()
+            if api_key:
+                try:
+                    from serpapi import GoogleSearch
+                    result = GoogleSearch({
+                        "engine": "google_scholar_author",
+                        "author_id": scholar_id,
+                        "api_key": api_key,
+                        "num": 100,
+                    }).get_dict()
+                    author_raw = result.get("author", {})
+                    cited_by_raw = result.get("cited_by", {})
+                    co_authors_raw = result.get("co_authors", [])
+                    articles_raw = result.get("articles", [])
+                    author_profile = {
+                        "name": author_raw.get("name", ""),
+                        "affiliations": author_raw.get("affiliations", ""),
+                        "email": author_raw.get("email", ""),
+                        "interests": [i.get("title", "") for i in author_raw.get("interests", [])],
+                        "thumbnail": author_raw.get("thumbnail", ""),
+                        "cited_by": cited_by_raw,
+                        "co_authors": [
+                            {"name": c.get("name", ""), "affiliations": c.get("affiliations", "")}
+                            for c in co_authors_raw if c.get("affiliations")
+                        ],
+                        "articles": [
+                            {"title": a.get("title", ""), "year": a.get("year", ""), "cited_by": a.get("cited_by", {}).get("value", 0) or 0}
+                            for a in articles_raw
+                        ],
+                    }
+                    with open(profile_path, "w") as f:
+                        json.dump(author_profile, f)
+                except Exception:
+                    pass
         return pd.read_csv(cache_path), author_profile
 
     # Try SerpAPI first if key is available
